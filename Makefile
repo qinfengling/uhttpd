@@ -1,137 +1,76 @@
-#
-# Copyright (C) 2010-2012 Jo-Philipp Wich <xm@subsignal.org>
-#
-# This is free software, licensed under the GNU General Public License v2.
-# See /LICENSE for more information.
-#
+CGI_SUPPORT ?= 1
+LUA_SUPPORT ?= 1
+TLS_SUPPORT ?= 1
+UHTTPD_TLS ?= cyassl
 
-include $(TOPDIR)/rules.mk
+CFLAGS ?= -I./lua-5.1.4/src $(TLS_CFLAGS) -O0 -ggdb3
+LDFLAGS ?= -L./lua-5.1.4/src
 
-PKG_NAME:=uhttpd
-PKG_RELEASE:=28.1
+CFLAGS += -Wall --std=gnu99
 
-PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
-PKG_CONFIG_DEPENDS := \
-	CONFIG_PACKAGE_uhttpd-mod-lua \
-	CONFIG_PACKAGE_uhttpd-mod-tls \
-	CONFIG_PACKAGE_uhttpd-mod-tls_cyassl \
-	CONFIG_PACKAGE_uhttpd-mod-tls_openssl
-
-include $(INCLUDE_DIR)/package.mk
-
-define Package/uhttpd/default
-  SECTION:=net
-  CATEGORY:=Network
-  SUBMENU:=Web Servers/Proxies
-  TITLE:=uHTTPd - tiny, single threaded HTTP server
-  MAINTAINER:=Jo-Philipp Wich <xm@subsignal.org>
-endef
-
-define Package/uhttpd
-  $(Package/uhttpd/default)
-  MENU:=1
-endef
-
-define Package/uhttpd/description
- uHTTPd is a tiny single threaded HTTP server with TLS, CGI and Lua
- support. It is intended as a drop-in replacement for the Busybox
- HTTP daemon.
-endef
-
-
-define Package/uhttpd-mod-tls
-  $(Package/uhttpd/default)
-  TITLE+= (TLS plugin)
-  DEPENDS:=uhttpd +PACKAGE_uhttpd-mod-tls_cyassl:libcyassl +PACKAGE_uhttpd-mod-tls_openssl:libopenssl
-endef
-
-define Package/uhttpd-mod-tls/description
- The TLS plugin adds HTTPS support to uHTTPd.
-endef
-
-define Package/uhttpd-mod-tls/config
-        choice
-                depends on PACKAGE_uhttpd-mod-tls
-                prompt "TLS Provider"
-                default PACKAGE_uhttpd-mod-tls_cyassl
-
-                config PACKAGE_uhttpd-mod-tls_cyassl
-                        bool "CyaSSL"
-
-                config PACKAGE_uhttpd-mod-tls_openssl
-                        bool "OpenSSL"
-        endchoice
-endef
-
-UHTTPD_TLS:=
-TLS_CFLAGS:=
-TLS_LDFLAGS:=
-
-ifneq ($(CONFIG_PACKAGE_uhttpd-mod-tls_cyassl),)
-  UHTTPD_TLS:=cyassl
-  TLS_CFLAGS:=-I$(STAGING_DIR)/usr/include/cyassl -DTLS_IS_CYASSL
-  TLS_LDFLAGS:=-lcyassl -lm
+ifeq ($(UHTTPD_TLS),openssl)
+  TLS_LDFLAGS ?= -L./openssl-0.9.8m -lssl
+  TLS_CFLAGS ?= -I./openssl-0.9.8m/include -DTLS_IS_OPENSSL
+else
+  TLS_LDFLAGS ?= -L./cyassl-1.4.0/src/.libs -lcyassl
+  TLS_CFLAGS ?= -I./cyassl-1.4.0/include -DTLS_IS_CYASSL
 endif
 
-ifneq ($(CONFIG_PACKAGE_uhttpd-mod-tls_openssl),)
-  UHTTPD_TLS:=openssl
-  TLS_CFLAGS:=-DTLS_IS_OPENSSL
-  TLS_LDFLAGS:=-lssl
+OBJ := uhttpd.o uhttpd-file.o uhttpd-utils.o
+LIB := -Wl,--export-dynamic -lcrypt -ldl
+
+TLSLIB :=
+LUALIB :=
+
+HAVE_SHADOW=$(shell echo 'int main(void){ return !getspnam("root"); }' | \
+	$(CC) -include shadow.h -xc -o/dev/null - 2>/dev/null && echo yes)
+
+ifeq ($(HAVE_SHADOW),yes)
+  CFLAGS += -DHAVE_SHADOW
+endif
+
+ifeq ($(TLS_SUPPORT),1)
+  CFLAGS += -DHAVE_TLS
+endif
+
+ifeq ($(CGI_SUPPORT),1)
+  CFLAGS += -DHAVE_CGI
+endif
+
+ifeq ($(LUA_SUPPORT),1)
+  CFLAGS += -DHAVE_LUA
 endif
 
 
-define Package/uhttpd-mod-lua
-  $(Package/uhttpd/default)
-  TITLE+= (Lua plugin)
-  DEPENDS:=uhttpd +liblua
-endef
+world: compile
 
-define Package/uhttpd-mod-lua/description
- The Lua plugin adds a CGI-like Lua runtime interface to uHTTPd.
-endef
+ifeq ($(CGI_SUPPORT),1)
+  OBJ += uhttpd-cgi.o
+endif
 
+ifeq ($(LUA_SUPPORT),1)
+  LUALIB := uhttpd_lua.so
 
-TARGET_CFLAGS += $(TLS_CFLAGS)
-TARGET_LDFLAGS += -Wl,-rpath-link=$(STAGING_DIR)/usr/lib
-MAKE_VARS += \
-	FPIC="$(FPIC)" \
-	LUA_SUPPORT="$(if $(CONFIG_PACKAGE_uhttpd-mod-lua),1)" \
-	TLS_SUPPORT="$(if $(CONFIG_PACKAGE_uhttpd-mod-tls),1)" \
-	UHTTPD_TLS="$(UHTTPD_TLS)" \
-	TLS_CFLAGS="$(TLS_CFLAGS)" \
-	TLS_LDFLAGS="$(TLS_LDFLAGS)"
+  $(LUALIB): uhttpd-lua.c
+		$(CC) $(CFLAGS) $(LDFLAGS) $(FPIC) \
+			-shared -lm -llua -ldl \
+			-o $(LUALIB) uhttpd-lua.c
+endif
 
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/* $(PKG_BUILD_DIR)/
-endef
+ifeq ($(TLS_SUPPORT),1)
+  TLSLIB := uhttpd_tls.so
 
-define Package/uhttpd/conffiles
-/etc/config/uhttpd
-/etc/uhttpd.crt
-/etc/uhttpd.key
-endef
+  $(TLSLIB): uhttpd-tls.c
+		$(CC) $(CFLAGS) $(LDFLAGS) $(FPIC) \
+			-shared $(TLS_LDFLAGS) \
+			-o $(TLSLIB) uhttpd-tls.c
+endif
 
-define Package/uhttpd/install
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/uhttpd.init $(1)/etc/init.d/uhttpd
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./files/uhttpd.config $(1)/etc/config/uhttpd
-	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd $(1)/usr/sbin/uhttpd
-endef
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-define Package/uhttpd-mod-tls/install
-	$(INSTALL_DIR) $(1)/usr/lib
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_tls.so $(1)/usr/lib/
-endef
+compile: $(OBJ) $(TLSLIB) $(LUALIB)
+	$(CC) -o uhttpd $(LDFLAGS) $(LIB) $(OBJ)
 
-define Package/uhttpd-mod-lua/install
-	$(INSTALL_DIR) $(1)/usr/lib
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_lua.so $(1)/usr/lib/
-endef
-
-
-$(eval $(call BuildPackage,uhttpd))
-$(eval $(call BuildPackage,uhttpd-mod-tls))
-$(eval $(call BuildPackage,uhttpd-mod-lua))
+clean:
+	rm -f *.o *.so uhttpd
